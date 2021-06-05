@@ -1,0 +1,432 @@
+<!doctype html>
+<html>
+	<head>
+		<title>DPTree-js</title>
+		<link rel="stylesheet" type="text/css" href="http://timohausmann.de/quadtree.js/style.css" />
+	</head>
+	<body>
+
+		<div class="outer">
+			<h1>Douglas-Peucker Tree Example</h1>
+			
+			<div id="canvasContainer">
+				<canvas id="map" width="640" height="480"></canvas>
+			</div>
+			
+
+			<div class="ctrl">
+				<div class="ctrl-left">
+					<button id="btn_clear">reset</button>
+				</div>
+
+				<div class="ctrl-right">
+					Points visited: <span id="pt_total">0</span> (<span id="pt_perc">0</span>%)<br />
+					Segments visited: <span id="n_total">0</span> (<span id="n_perc">0</span>%)
+				</div>
+			</div>
+			
+			<div>
+                <h2>Use-Case</h2>
+                <p>A tool to fit arbitrary geo-coordinates (GPS) with errors performantly onto a predefined path
+                for live geo-tracking.</p>
+                <h2>Usage</h2>
+                <p>The mouse cursor is the GPS source, with an accuracy roughly the size of the circle. The
+                green dot follows the mouse on the path starting at the red dot, without jumping at intersections
+                or close segments.</p>
+                <p>It will only move "forward" in segments, but can move backward within the coordinates inside
+                the current segment (assuming the tracked person will only move forward along the route).</p>
+                <p>Yellow lines show the subdivision path segments that are used for finding the closest point.</p>
+                <h2>Algorithm</h2>
+                <p>This algorithm subdivides a path of (geo)coordinates via Duglas-Peucker into a simplified
+                version, building a tree of the simplifications. It then iteratively finds the closest point on
+                those subsections to finally find the closest point on the original path.</p>
+                <p>This improves the performance of finding the closest point, especially for paths with a high
+                number of close coordinates. It improves accuracy and performance over a QuadTree approach for
+                cases where the path intersects itself or creates "holes".</p>
+                <p>Also, the algorithm uses a forward-only search with a cut-off at a specific amount of distance
+                along the path (that could be calculated from avg travel speed), to further optimize for the
+                use-case of following geo-tracking coordinates that should trace a specific path/route.</p>
+			</div>
+		</div>
+		
+		<script src="dataset1.js"></script>
+
+        <script src="vector.js"></script>
+        <script>
+        /**
+		 * Reduce an array of LatLng objects or points via Douglas-Peucker with threshold value epsilon
+		 * @param latlngs array
+		 * @param epsilon float
+		 */
+        function DPTree(latlngs, epsilon) {
+            this.latlngs = latlngs;
+            this.epsilon = epsilon;
+            this.nodes = [];
+            this.visited = false;
+            this.lastIndex = 0;
+            this.distance = 0;
+            this.depth = this.reduce();
+        }
+
+        /**
+		 * Reduce an array of LatLng objects or points via Douglas-Peucker with threshold value epsilon
+		 * @param latlngs array
+		 * @param epsilon float
+		 * @return number The depth of the tree
+		 */
+		DPTree.prototype.reduce = function() {
+            var latlngs = this.latlngs, epsilon = this.epsilon;
+			if (this.nodes.length > 0) return this.depth;
+
+			var dmax = 0, left, right;
+			var p1 = new L.trackmyrace.Vector(latlngs[0]);
+			var p2 = new L.trackmyrace.Vector(latlngs[latlngs.length-1]);
+
+            if (latlngs.length <= 2) {
+                this.distance = p2.distance(p1);
+                return 0;
+            }
+
+			var normale = p2.sub(p1).perpendicular().unit();
+			var index = 0;
+			if (latlngs.length > 10 || normale.length() < 0.001) {
+                dmax = epsilon + 1;
+                index = Math.floor(latlngs.length / 2);
+                this.distance = p2.distance(p1);
+            } else {
+                var prev = p1;
+                this.distance = 0;
+                for (var i=1; i < latlngs.length-1; i++)
+                {
+                    var p = new L.trackmyrace.Vector(latlngs[i]);
+                    var d = Math.abs(normale.dot(p.sub(p1)));
+
+                    this.distance += p.distance(prev);
+                    prev = p;
+ 
+                    if (d > dmax)
+                    {
+                        dmax = d;
+                        index = i;
+                    }
+                }
+                this.distance += p2.distance(prev);
+            }
+
+            this.epsilon = dmax;
+			if (dmax > epsilon)
+			{
+				this.nodes[0] = new DPTree(latlngs.slice(0, index+1), epsilon);
+				this.nodes[1] = new DPTree(latlngs.slice(index), epsilon);
+
+                this.distance = this.nodes[0].distance + this.nodes[1].distance;
+				this.latlngs = [latlngs[0], latlngs[latlngs.length-1]];
+				return Math.max(this.nodes[0].depth, this.nodes[1].depth) + 1;
+			}
+			return 0;
+		}
+
+		DPTree.prototype.flatten = function(epsilon) {
+            var levels = parseInt(this.depth / 3 * 2);
+            while (--levels >= 0) {
+                if (this.nodes.length === 0) break;
+
+                var nodes = this.nodes[0].nodes;
+                for (var i=1; i<this.nodes.length; i++) {
+                    if (this.nodes[i].nodes.length > 0 && this.nodes[i].epsilon > epsilon) {
+                        nodes = nodes.concat(this.nodes[i].nodes);
+                    } else {
+                        nodes.push(this.nodes[i]);
+                    }
+                }
+                this.nodes = nodes;
+            }
+            this.depth = 1;
+            this.latlngs = [];
+            for (var i=0; i<this.nodes.length; i++) {
+                this.depth = Math.max(this.depth, this.nodes[i].depth + 1);
+                this.latlngs = this.latlngs.concat(this.nodes[i].latlngs.slice(1));
+            }
+		}
+
+        DPTree.prototype.closest = function(latlng) {
+            this.visited = true;
+            var distance = Number.MAX_VALUE;
+            var closest = null;
+            var latlngs = this.latlngs;
+            var p = new L.trackmyrace.Vector(latlng);
+            for (var i=0; i < latlngs.length - 1; i++) {
+                var p1 = new L.trackmyrace.Vector(latlngs[i]);
+                var p2 = new L.trackmyrace.Vector(latlngs[i+1]);
+
+                var segment = p2.sub(p1);
+                var unit = segment.unit();
+                if (unit.iszero()) continue;
+
+                var P = p.sub(p1);      // The vector describing the searched point relative to p1
+                var t = segment.div(segment.sqlength()).dot(P);    // Where on the segment the closest point to p is
+
+                if (t <= 0.0) {
+                    closestOnSegment = p1;
+                } else if (t >= 1.0) {
+                    closestOnSegment = p2;
+                } else {
+                    closestOnSegment = p1.add(segment.mul(t));
+                }
+                var distanceFromSegment = closestOnSegment.sub(p).length();
+                if (distanceFromSegment < distance) {
+                    distance = distanceFromSegment;
+                    closest = closestOnSegment;
+                }
+            }
+            return { distance: distance, latlng: closest };
+        }
+
+        DPTree.prototype.find = function(latlng, maxDistance = 0) {
+            this.visited = true;
+            this.nodesVisited = 0;
+            this.pointsVisited = 0;
+            if (this.nodes.length === 0) {
+                this.pointsVisited += this.latlngs.length;
+                return this.closest(latlng);
+            }
+            var closest = { distance: Number.MAX_VALUE, latlng: null };
+            var closestNode;
+            var i = this.lastIndex;
+            var totalDistance = 0;
+            if (!maxDistance) maxDistance = Number.MAX_VALUE;
+            while (i < this.nodes.length && totalDistance < maxDistance) {
+                this.pointsVisited += this.nodes[i].latlngs.length;
+                var next = this.nodes[i].closest(latlng);
+                if (i > this.lastIndex) {
+                    totalDistance += this.nodes[i].distance;
+                }
+                if (next.distance < closest.distance && next.distance < 10) {
+                    closest = next;
+                    closestNode = this.nodes[i];
+                    this.lastIndex = i;
+                }
+                i++;
+                this.nodesVisited++;
+            }
+
+            var closestPoint = closestNode.find(latlng);
+            this.nodesVisited += closestNode.nodesVisited;
+            this.pointsVisited += closestNode.pointsVisited;
+            return closestPoint;
+        }
+
+        DPTree.prototype.unmark = function() {
+            this.visited = false;
+            for (var i=0; i<this.nodes.length; i++) {
+                this.nodes[i].unmark();
+            }
+        }
+
+        DPTree.prototype.reset = function() {
+            this.lastIndex = 0;
+            for (var i=0; i<this.nodes.length; i++) {
+                this.nodes[i].reset();
+            }
+        }
+        </script>
+
+        <script>
+        (function(w, Math) {
+            w.requestAnimFrame = (function () {
+				return  w.requestAnimationFrame ||
+					w.webkitRequestAnimationFrame ||
+					w.mozRequestAnimationFrame ||
+					w.oRequestAnimationFrame ||
+					w.msRequestAnimationFrame ||
+					function (callback) {
+						w.setTimeout(callback, 1000 / 60);
+					};
+			})();
+
+            console.time('dptree');
+            var dpt = new DPTree(data, 0.00001);
+            dpt.flatten(0.002);
+            console.timeEnd('dptree');
+            console.log(dpt.depth);
+            w.dpt = dpt;
+            
+            var bounds = {};
+            bounds.min = data.reduce(function(min, latlng) {
+                return [Math.min(min[0], latlng[0]), Math.min(min[1], latlng[1])];
+            });
+            bounds.max = data.reduce(function(max, latlng) {
+                return [Math.max(max[0], latlng[0]), Math.max(max[1], latlng[1])];
+            });
+            var ctx = document.getElementById('map').getContext('2d');
+
+
+			/*
+			 * our "hero", aka the mouse cursor.
+			 * He is not in the quadtree, we only use this object to retrieve objects from a certain area
+			 */
+			var myCursor = [];
+
+			var isMouseover = false;
+
+			/*
+			 * position hero at mouse
+			 */
+			var handleMousemove = function(e) {
+				
+				isMouseover = true;
+				
+				if(!e.offsetX) {
+					e.offsetX = e.layerX - e.target.offsetLeft;
+					e.offsetY = e.layerY - e.target.offsetTop;
+				} 
+				
+				myCursor[0] = e.offsetX;
+				myCursor[1] = e.offsetY;		
+			};
+
+
+			/*
+			 * hide hero
+			 */
+			var handleMouseout = function(e) {
+				
+				isMouseover = false;
+			};
+
+            var handleClear = function(e) {
+                dpt.reset();
+            };
+
+            document.getElementById('map').addEventListener('mousemove', handleMousemove);
+			document.getElementById('map').addEventListener('mouseout', handleMouseout);
+			document.getElementById('btn_clear').addEventListener('click', handleClear);
+
+            var zoom = 10;
+            var mapBounds = {
+                min: (new L.trackmyrace.Vector(bounds.min)).project(zoom),
+                max: (new L.trackmyrace.Vector(bounds.max)).project(zoom)
+            };
+
+            function mercator2screen(p) {
+                var scaleX = ctx.canvas.width / (mapBounds.max[0] - mapBounds.min[0]);
+                var scaleY = ctx.canvas.height / (mapBounds.max[1] - mapBounds.min[1]);
+                if (Math.abs(scaleX) > Math.abs(scaleY)) {
+                    scaleX /= Math.abs(scaleY);
+                } else {
+                    scaleY /= Math.abs(scaleX);
+                }
+                return {
+                    x: (p[0] - mapBounds.min[0]) * scaleX,
+                    y: ctx.canvas.height - (p[1] - mapBounds.min[1]) * scaleY
+                };
+            }
+
+            function screen2mercator(p) {
+                var scaleX = (mapBounds.max[0] - mapBounds.min[0]) / ctx.canvas.width;
+                var scaleY = (mapBounds.max[1] - mapBounds.min[1]) / ctx.canvas.height;
+                if (Math.abs(scaleX) <= Math.abs(scaleY)) {
+                    scaleX /= Math.abs(scaleY);
+                } else {
+                    scaleY /= Math.abs(scaleX);
+                }
+                return [(p[0] * scaleX + mapBounds.min[0]),
+                        ((ctx.canvas.height - p[1]) * scaleY + mapBounds.min[1])];
+            }
+
+            function drawMap(dptree, zoom = 10, level = 0) {
+                function drawLevel(dptree, zoom, level) {
+                    if (dptree.nodes.length === 0 || dptree.visited) {
+                    if (dptree.latlngs.length > 1) {
+                        ctx.beginPath();
+                        if (dptree.visited) {
+                            ctx.strokeStyle = 'rgba(255,204,0,' + (1.0 - level / 20).toString() + ')';
+                        } else {
+                            ctx.strokeStyle = 'rgba(255,255,255,' + (1.0 - level / 20).toString() + ')';
+                        }
+                        var pt = mercator2screen((new L.trackmyrace.Vector(dptree.latlngs[0])).project(zoom));
+                        ctx.moveTo(pt.x, pt.y);
+                        for (var i=1; i<dptree.latlngs.length; i++) {
+                            var pt = mercator2screen((new L.trackmyrace.Vector(dptree.latlngs[i])).project(zoom));
+                            ctx.lineTo(pt.x, pt.y);
+                        }
+                        ctx.stroke();
+                    }
+                    }
+                    if (dptree.nodes.length > 0) {
+                        for (var i=0; i<dptree.nodes.length; i++) {
+                            drawLevel(dptree.nodes[i], zoom, level + 1);
+                        }
+                    }
+                }
+
+                // Start-Point (first coordinate)
+                var pt = mercator2screen((new L.trackmyrace.Vector(dptree.latlngs[0])).project(zoom));
+                ctx.beginPath();
+                ctx.fillStyle = 'rgba(255,0,0,0.5)';
+                ctx.arc( pt.x, pt.y, 3, 0, 2 * Math.PI );
+                ctx.fill();
+                
+                drawLevel(dptree, zoom, level);
+            }
+
+            var perf = {
+                min: Number.MAX_VALUE,
+                max: 0,
+                avg: 0,
+                last: []
+            };
+            w.perf = perf;
+
+            var lastTimestamp = null;
+            var closestMap = null;
+			/*
+			 * our main loop
+			 */
+			var loop = function() {
+				
+				ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+
+                dpt.unmark();
+				if( isMouseover ) {
+
+                    ctx.beginPath();
+					ctx.fillStyle = 'rgba(255,255,255,0.5)';
+					ctx.arc( myCursor[0], myCursor[1], 10, 0, 2 * Math.PI );
+					ctx.fill();
+					
+					var cursor = new L.trackmyrace.Vector(screen2mercator( myCursor )).unproject(zoom);
+					var maxDistance = lastTimestamp ? ((performance.now() - lastTimestamp) / 1000 / 3600) /*hours*/ * 10 /*kmh*/ : 0.1;
+					var start = lastTimestamp = performance.now();
+					var closest = dpt.find( cursor, maxDistance );
+					var time = performance.now() - start;
+					document.getElementById('pt_total').textContent = dpt.pointsVisited;
+					document.getElementById('pt_perc').textContent = ((dpt.pointsVisited / data.length) * 100).toFixed(2);
+					document.getElementById('n_total').textContent = dpt.nodesVisited;
+					document.getElementById('n_perc').textContent = ((dpt.nodesVisited / dpt.nodes.length) * 100).toFixed(2);
+					dpt.visited = false;
+					perf.min = Math.min(perf.min, time);
+					perf.max = Math.max(perf.max, time);
+					perf.last.push(time);
+					if (perf.last.length > 100) {
+                        perf.last.splice(0, 1);
+					}
+					perf.avg = perf.last.reduce(function(acc, val) { return acc + val; }) / perf.last.length;
+					closestMap = mercator2screen(closest.latlng.project(zoom));
+				}
+				if (closestMap !== null) {
+                    ctx.beginPath();
+                    ctx.fillStyle = 'rgba(48,255,48,0.8)';
+                    ctx.arc( closestMap.x, closestMap.y, 2, 0, 2 * Math.PI );
+					ctx.fill();
+				}
+
+                drawMap(dpt, zoom);
+
+				requestAnimFrame( loop );
+			};
+            setTimeout(loop, 100);
+        })(window, Math);
+        </script>
+	</body>
+</html>
